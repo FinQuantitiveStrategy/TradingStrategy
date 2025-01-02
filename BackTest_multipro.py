@@ -1,6 +1,5 @@
 
 #在开头设置好全局参数后即可开始回测
-# 运行需要一个叫做沪深列表.csv的文件，放根目录即可
 import pandas as pd
 from MyTT import *
 from 公式库 import *
@@ -12,7 +11,8 @@ import importlib
 import logging
 #无视警告
 import warnings
-from DataConnector import  db,query_stock_data,query_stock_heatdata,query_stock_basicinfo,query_single_stock_point,query_stock_fiveline
+from DataConnector import query_stock_data,query_stock_heatdata,query_stock_basicinfo,query_single_stock_point,query_stock_fiveline
+from DBAccess import dbconn, dbCloseall
 from StockPool import StockSet
 warnings.filterwarnings("ignore")
 logging.basicConfig(
@@ -22,14 +22,14 @@ logging.basicConfig(
 )
 #初始化部分，设立数据库连接、全局性的参数
 programStartTime = time.time()
-# 连接数据库
-
-conn = db.get_conn()
 
 #region 设置全局参数.
 config = {
 	"策略路径": "StrategyPool",
-	"策略": "Buy4win", #hotStockFollow 热度策略  OldtrendFollew右侧追击反转策略 trendFollew历史新高趋势追随策略 Buy4win买就赢利策略 Fiveline五线谱策略
+	"策略": [
+		"templateStrategy",
+		"Buy4win"
+	], #hotStockFollow 热度策略  OldtrendFollew右侧追击反转策略 trendFollew历史新高趋势追随策略 Buy4win买就赢利策略 Fiveline五线谱策略
 	'额外数据需求': {
 		# None
 		# 'basic_stock_info': query_stock_basicinfo,
@@ -44,8 +44,8 @@ config = {
 	# "剔除ST" : True,  #True剔除ST股票
 	'回测开始时间' : "2018-01-01",
 	"回测结束时间" : "2024-10-14",
-	"使用进程数" :multiprocessing.cpu_count(),#自动获取，一般不会错
-	'回测输出文件名' : "近期买就赢利+黄金底+90天内dif二次卖+90天外趋势卖+急涨大绿柱止盈+周MACD止损+开盘价计算.csv"
+	"使用进程数" : multiprocessing.cpu_count(),#自动获取，一般不会错
+	'回测输出文件名' : "回测输出.csv"
 	# '回测输出文件名' : "主力建仓+五线谱超跌+14型买入+财务评分60买+90天内dif二次卖+急涨大绿柱止盈+90天外超级趋势卖+开盘价计算.csv"
 }
 buy_price_type = '收盘' if config['买入价格'] == "收盘" else 'next_open'
@@ -76,31 +76,32 @@ if stockcodedf.shape[0] <= 0:
 
 # 导入策略池
 module = importlib.import_module(config["策略路径"])
-# 从策略池中导入想要测试的策略
-strategy = getattr(module, config["策略"])
+
+ 
 
 #region 回测单支股票
-def calcStock(stocknum,start,end): 
+def calcStock(stocknum,start,end, strategyname): 
+	strategy = getattr(module, strategyname)
+	start_time = time.time()
 	try:
-		print('Spawned child PID: ', os.getpid())
 		debugout = '' # 过程打印缓存
 
-		start_time = time.time()
-		debugout = debugout + f"\t证券代码 {stocknum}\n"
+		debugout = debugout + f"{stocknum} "
 
 
 		# -------回测数据加载 ------
 		#初始化--加载需要使用的历史数据（包括K线或者其它数据）
+		
+		conn = dbconn()
 
 		kilne =query_stock_data(
-		conn,
 		code_to_query = stocknum,
 		start_date = start, 
 		end_date = end,
 		)
 
 		if len(kilne.index)<50:
-			return  stocknum, []
+			return  [stocknum, [], f"{stocknum} 数据长度不足"]
 		data_to_pass = {}
 		data_to_pass['kline'] = kilne
 
@@ -114,8 +115,8 @@ def calcStock(stocknum,start,end):
 										start,
 										end)
 				data_to_pass[data_type] = data
-		init_time = time.time()  # 获取此前代码块运行消耗时间
-		debugout = debugout + f"初始化用时: \t {init_time -start_time}\n"
+		init_time = time.time() - start_time  # 获取此前代码块运行消耗时间
+		debugout = debugout + f"数据用时 {init_time:.4f} "
 
 		# 执行交易策略
 		df = strategy(**data_to_pass)
@@ -172,15 +173,18 @@ def calcStock(stocknum,start,end):
 									'yield': profit_percentage # 收益率
 									})
 
-		loop_time = time.time()  # 获取此前代码块运行消耗时间
-		debugout = debugout + f"全部用时: \t {loop_time - start_time} \n"
-		print(debugout, '\n')
-		return stocknum, transactions
+		loop_time = time.time() - start_time # 获取此前代码块运行消耗时间
+		debugout = debugout + f"全部用时 {loop_time:.4}"
+		#print(debugout)
+		result = [stocknum, transactions, debugout]
+		return result
 	except Exception as e:
-			# 记录详细错误信息
-			logging.error(f"Error occurred in calcStock with stocknum: {stocknum}, "
-						f"Error: {e}")
-			return stocknum, []
+		# 记录详细错误信息
+		logging.error(f"Error occurred in calcStock with stocknum: {stocknum}, "
+					f"Error: {e}")
+		print('Error:', f"{e}")
+		result = [stocknum, [], f"{e}"]
+		return result
 #endregion
 
 #region 输出调整
@@ -228,33 +232,46 @@ def sortSheets(df):
 # endregion
 
 # region回测调度
-def backTest(begin_date,end_date):
+def backTest(begin_date,end_date, strategyname):
+
+	joblog = '回测启动: ' + strategyname + '\n'
+
+	joblog = joblog + f"Parent PID: {os.getpid()} \n"
 
 	print('Parent PID: ', os.getpid())
 	jobs = []
 	pool = multiprocessing.Pool(config['使用进程数'])
 
+	print('Appending Pool Started.')
 	for nthstock in range(0, stockcodedf.shape[0]):#stockcodedf.shape[0]
 		stocknum = stockcodedf.at[nthstock,'StockCode']
-		# calcStock('600004',begin_date,end_date)
-		p = pool.apply_async(calcStock, args=(stocknum,begin_date,end_date)) 
+		p = pool.apply_async(calcStock, args=(stocknum,begin_date,end_date, strategyname)) 
 		jobs.append(p)
-
-
+	
+	print('All Jobs Queued.')
 
 	pool.close()
 	pool.join()
 	print('All subprocess done.')
 
 	allresult = {}
-	for j in jobs: 
-		num, r = j.get()
-		allresult[num] = r
+	calclog = {}
+	for job in jobs: 
+		res = job.get()
+		num = res[0]
+		#print(res)
+		allresult[num] = res[1]
+		calclog[num] = res[2]
 
 	allresult = dict(sorted(allresult.items()))
+	calclog = dict(sorted(calclog.items()))
+	#print(calclog)
+	for each in calclog:
+		joblog = joblog + f"{calclog[each]}\n"
 
 	try: 
-		db.close_conn() # 回测结束后统一关闭数据库
+		#db.close_conn() # 回测结束后统一关闭数据库
+		pass
 	except Exception as e:
 		print(f"database failed in closing : {e}")
 
@@ -265,21 +282,48 @@ def backTest(begin_date,end_date):
 			aggregated_transactions.append(transaction)
 	if(aggregated_transactions == []):
 		print('Warning: no purchase! No csv generated.')
+		joblog = joblog + "Warning: no purchase!"
 		exit(0)
 
 	# 创建DataFrame汇总
 	transactions_df = pd.DataFrame(aggregated_transactions)
 	transactions_df = sortSheets(transactions_df)
 	
-	transactions_df.to_csv(config['回测输出文件名'], 
-						   index=False, 
+	transactions_df = transactions_df.to_csv(None, 
+						   index=True, 
 						   encoding='utf-8' ,
-						   mode='w'  # mode='w'代表覆盖之前的文件，mode='a'，代表接在原来数据的末尾
+						   #mode='w'  # mode='w'代表覆盖之前的文件，mode='a'，代表接在原来数据的末尾
 						   ) 
 
-	print('全部程序用时: ', time.time() - programStartTime)
+	#print('全部程序用时: ', time.time() - programStartTime)
+	joblog = joblog + '策略 ' + strategyname + ' 用时: ' + f"{time.time() - programStartTime}"
+
+	return transactions_df, joblog
+
 # endregion
-if  __name__ == "__main__":
+
+def testAll(begindate=None, enddate=None):
 	begin_date = config['回测开始时间']
+	if begindate != None:
+		begin_date = begindate
 	end_date = config['回测结束时间']
-	backTest(begin_date,end_date)
+	if enddate != None:
+		end_date = enddate
+
+	# 从策略池中导入想要测试的策略
+	txall = {}
+	joblogs = {}
+	for each in config['策略']:
+		print('Running strategy:', each)
+		transactions, joblog = backTest(begin_date,end_date, each)
+		txall[each] = transactions
+		joblogs[each] = joblog
+	
+	return txall, joblogs
+
+
+if  __name__ == "__main__":
+	
+	txall, joblogs = testAll()
+	print('Done. Start typing to use REPL.')
+	# If running standalone, use "python3 -i" to get into interactive. 
